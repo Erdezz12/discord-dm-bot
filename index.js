@@ -10,6 +10,9 @@ const client = new Client({
   ]
 });
 
+// ⚠️ Mets ici l'ID de ton salon autorisé
+const SALON_AUTORISE = '1499697501115125861';
+
 // Enregistre la slash command /dmall
 client.once('ready', async () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
@@ -17,10 +20,10 @@ client.once('ready', async () => {
   const commands = [
     new SlashCommandBuilder()
       .setName('dmall')
-      .setDescription('Envoie un DM personnalisé à tous les membres')
+      .setDescription('Envoie un DM à tous les membres du serveur')
       .addStringOption(option =>
         option.setName('message')
-          .setDescription('Le message à envoyer (utilise {user} pour le prénom)')
+          .setDescription('Le message à envoyer — utilise {user} pour le pseudo du membre')
           .setRequired(true)
       )
   ].map(cmd => cmd.toJSON());
@@ -34,7 +37,7 @@ client.once('ready', async () => {
     );
     console.log('✅ Slash command /dmall enregistrée !');
   } catch (err) {
-    console.error('Erreur enregistrement commande :', err);
+    console.error('❌ Erreur enregistrement commande :', err);
   }
 });
 
@@ -43,23 +46,39 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'dmall') return;
 
+  // Vérification du salon
+  if (interaction.channelId !== SALON_AUTORISE) {
+    return interaction.reply({
+      content: `❌ Cette commande est uniquement disponible dans <#${SALON_AUTORISE}> !`,
+      ephemeral: true
+    });
+  }
+
   // Vérification admin
   if (!interaction.member.permissions.has('Administrator')) {
-    return interaction.reply({ content: '❌ Tu dois être administrateur !', ephemeral: true });
+    return interaction.reply({
+      content: '❌ Tu dois être administrateur pour utiliser cette commande !',
+      ephemeral: true
+    });
   }
 
   const customMessage = interaction.options.getString('message');
 
-  await interaction.reply({ content: '📨 Envoi des DMs en cours...', ephemeral: true });
+  await interaction.reply({
+    content: '📨 Envoi des DMs en cours...',
+    ephemeral: true
+  });
 
+  // Récupère tous les membres du serveur
   const members = await interaction.guild.members.fetch();
 
   let success = 0;
   let failed = 0;
 
   for (const [, member] of members) {
-    if (member.user.bot) continue;
+    if (member.user.bot) continue; // Ignore les bots
 
+    // Personnalisation du message
     const personalizedMsg = customMessage
       .replace(/{user}/g, member.displayName)
       .replace(/{tag}/g, member.user.tag);
@@ -67,13 +86,17 @@ client.on('interactionCreate', async (interaction) => {
     try {
       await member.send(personalizedMsg);
       success++;
+      // Pause pour éviter le rate limit Discord
       await new Promise(r => setTimeout(r, 1000));
     } catch (err) {
-      failed++;
+      failed++; // Membre avec DMs fermés
     }
   }
 
-  await interaction.followUp({ content: `✅ **${success}** DMs envoyés, **${failed}** échoués (DMs fermés).`, ephemeral: true });
+  await interaction.followUp({
+    content: `✅ Terminé ! **${success}** DMs envoyés avec succès, **${failed}** échoués (DMs fermés).`,
+    ephemeral: true
+  });
 });
 
 client.login(process.env.TOKEN);
