@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+console.log('TOKEN chargé :', process.env.TOKEN ? 'OUI ✅' : 'NON ❌');
 
 const client = new Client({
   intents: [
