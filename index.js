@@ -1,5 +1,11 @@
-require('dotenv').config();
-console.log('TOKEN chargé :', process.env.TOKEN ? 'OUI ✅' : 'NON ❌');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+
+// Sur Railway, pas besoin de dotenv, les variables sont injectées directement
+const TOKEN = process.env.TOKEN;
+const SALON_AUTORISE = process.env.SALON_AUTORISE;
+
+console.log('TOKEN chargé :', TOKEN ? 'OUI ✅' : 'NON ❌');
+console.log('SALON chargé :', SALON_AUTORISE ? 'OUI ✅' : 'NON ❌');
 
 const client = new Client({
   intents: [
@@ -10,10 +16,6 @@ const client = new Client({
   ]
 });
 
-// ⚠️ Mets ici l'ID de ton salon autorisé
-const SALON_AUTORISE = '1499697501115125861';
-
-// Enregistre la slash command /dmall
 client.once('ready', async () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
 
@@ -23,12 +25,12 @@ client.once('ready', async () => {
       .setDescription('Envoie un DM à tous les membres du serveur')
       .addStringOption(option =>
         option.setName('message')
-          .setDescription('Le message à envoyer — utilise {user} pour le pseudo du membre')
+          .setDescription('Le message à envoyer — utilise {user} pour le pseudo')
           .setRequired(true)
       )
   ].map(cmd => cmd.toJSON());
 
-  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
 
   try {
     await rest.put(
@@ -41,12 +43,10 @@ client.once('ready', async () => {
   }
 });
 
-// Gestion de la commande /dmall
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'dmall') return;
 
-  // Vérification du salon
   if (interaction.channelId !== SALON_AUTORISE) {
     return interaction.reply({
       content: `❌ Cette commande est uniquement disponible dans <#${SALON_AUTORISE}> !`,
@@ -54,10 +54,9 @@ client.on('interactionCreate', async (interaction) => {
     });
   }
 
-  // Vérification admin
   if (!interaction.member.permissions.has('Administrator')) {
     return interaction.reply({
-      content: '❌ Tu dois être administrateur pour utiliser cette commande !',
+      content: '❌ Tu dois être administrateur !',
       ephemeral: true
     });
   }
@@ -69,16 +68,13 @@ client.on('interactionCreate', async (interaction) => {
     ephemeral: true
   });
 
-  // Récupère tous les membres du serveur
   const members = await interaction.guild.members.fetch();
-
   let success = 0;
   let failed = 0;
 
   for (const [, member] of members) {
-    if (member.user.bot) continue; // Ignore les bots
+    if (member.user.bot) continue;
 
-    // Personnalisation du message
     const personalizedMsg = customMessage
       .replace(/{user}/g, member.displayName)
       .replace(/{tag}/g, member.user.tag);
@@ -86,17 +82,16 @@ client.on('interactionCreate', async (interaction) => {
     try {
       await member.send(personalizedMsg);
       success++;
-      // Pause pour éviter le rate limit Discord
       await new Promise(r => setTimeout(r, 1000));
     } catch (err) {
-      failed++; // Membre avec DMs fermés
+      failed++;
     }
   }
 
   await interaction.followUp({
-    content: `✅ Terminé ! **${success}** DMs envoyés avec succès, **${failed}** échoués (DMs fermés).`,
+    content: `✅ Terminé ! **${success}** DMs envoyés, **${failed}** échoués (DMs fermés).`,
     ephemeral: true
   });
 });
 
-client.login(process.env.TOKEN);
+client.login(TOKEN);
