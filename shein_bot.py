@@ -1,3 +1,4 @@
+import os
 """
 Bot Telegram Shein - @Bonsplanshein
 - Envoyez un lien Shein → le bot scrape automatiquement image, nom, prix
@@ -15,9 +16,9 @@ from telegram.ext import (
 )
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN       = "8630597675:AAH_HEK-Yk9uvF8CDRXynMDnggt1r1PKu7M"
-CANAL           = "@Bonsplanshein"
-CODE_AFFIL      = "TU87V"
+BOT_TOKEN       = os.environ.get("BOT_TOKEN", "8630597675:AAH_HEK-Yk9uvF8CDRXynMDnggt1r1PKu7M")
+CANAL           = os.environ.get("CANAL", "@Bonsplanshein")
+CODE_AFFIL      = os.environ.get("CODE_AFFIL", "TU87V")
 REMISE          = "60%"
 # ─────────────────────────────────────────────────────────────────────────────
 
