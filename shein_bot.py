@@ -1,6 +1,5 @@
-import os, logging, re, json, base64
+import os, logging, re, json, asyncio
 import requests
-from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CallbackQueryHandler,
@@ -10,8 +9,11 @@ from telegram.ext import (
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "METS_TON_TOKEN_ICI")
 CANAL      = os.environ.get("CANAL", "@Bonsplanshein")
 CODE_AFFIL = os.environ.get("CODE_AFFIL", "TU87V")
-CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")
 REMISE     = "60%"
+
+# ─── Ton ID Telegram — seul toi peux utiliser le bot ─────────────────────────
+# Pour trouver ton ID : envoie /start à @userinfobot sur Telegram
+OWNER_ID   = int(os.environ.get("OWNER_ID", "0"))  # remplace 0 par ton ID
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 WAIT_PRICE = 1
@@ -19,7 +21,6 @@ WAIT_PRICE = 1
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 # ─── Résolution lien court ────────────────────────────────────────────────────
@@ -32,68 +33,133 @@ def resolve_url(url: str) -> str:
         logging.warning(f"Redirect error: {e}")
         return url
 
-# ─── Extraction via Claude AI ─────────────────────────────────────────────────
+# ─── Nettoyage nom produit ────────────────────────────────────────────────────
 
-def extract_with_claude(url: str, html_snippet: str) -> dict:
-    if not CLAUDE_KEY:
-        return {}
+def clean_name(raw: str) -> str:
+    """
+    Shein met des noms ultra longs avec des mots-clés SEO.
+    On garde seulement les 6 premiers mots significatifs.
+    Ex: "SHEGLAM Longwear Invisible Hold Colle Pour Cils-Clear Marque..."
+    → "SHEGLAM Longwear Invisible Hold Colle Pour Cils"
+    """
+    if not raw:
+        return "Produit Shein"
+    # Supprimer les parties génériques après certains mots-clés
+    cut_words = [
+        "pour femme", "pour homme", "pour fille", "pour garçon",
+        "mode", "casual", "fashion", "style", "women", "men",
+        "printemps", "été", "automne", "hiver", "y2k",
+        "anniversaire", "noël", "cadeau", "idéal"
+    ]
+    name_lower = raw.lower()
+    cut_pos = len(raw)
+    for w in cut_words:
+        pos = name_lower.find(w)
+        if pos > 20:  # pas au tout début
+            cut_pos = min(cut_pos, pos)
+    raw = raw[:cut_pos].strip(" -,|")
+
+    # Garder max 7 mots
+    words = raw.split()
+    if len(words) > 7:
+        raw = " ".join(words[:7])
+
+    return raw.strip(" -,|") or "Produit Shein"
+
+# ─── Scraping avec Playwright (rendu JS) ─────────────────────────────────────
+
+async def scrape_with_playwright(url: str) -> dict:
+    """Scraping complet avec navigateur headless pour récupérer prix/nom/image."""
+    result = {"name": None, "price": None, "image": None}
     try:
-        prompt = f"""Voici le HTML d'une page produit Shein (URL: {url}).
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            ctx = await browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="fr-FR",
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"}
+            )
+            page = await ctx.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(4000)  # attend le JS
 
-Extrait ces informations en JSON uniquement, sans backticks :
-{{
-  "name": "nom complet du produit en français",
-  "price": "prix en chiffres uniquement ex: 12.99",
-  "image": "URL de l'image principale du produit"
-}}
+            html = await page.content()
 
-Si une info est introuvable, mets null.
+            # Nom via og:title ou h1
+            og_title = await page.evaluate("() => document.querySelector('meta[property=\"og:title\"]')?.content")
+            h1 = await page.evaluate("() => document.querySelector('h1')?.innerText")
+            result["name"] = og_title or h1
 
-HTML (tronqué) :
-{html_snippet[:6000]}"""
+            # Image via og:image
+            og_img = await page.evaluate("() => document.querySelector('meta[property=\"og:image\"]')?.content")
+            result["image"] = og_img
 
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": CLAUDE_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 300,
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=20
-        )
-        text = resp.json()["content"][0]["text"].strip()
-        text = re.sub(r"```json|```", "", text).strip()
-        return json.loads(text)
+            # Prix — plusieurs sélecteurs Shein possibles
+            price_selectors = [
+                ".product-intro__head-price .from",
+                ".product-intro__head-price .origin",
+                "[class*='price'] .from",
+                "[class*='sale-price']",
+                "[data-test='price']",
+                ".price-wrapper .price",
+                ".j-sa-product-detail-price",
+            ]
+            for sel in price_selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        txt = await el.inner_text()
+                        m = re.search(r'[\d]+[.,]\d{2}', txt.replace(" ", ""))
+                        if m:
+                            result["price"] = m.group(0).replace(",", ".")
+                            break
+                except Exception:
+                    pass
+
+            # Fallback prix dans le HTML
+            if not result["price"]:
+                for pattern in [
+                    r'"salePrice"[:\s]*\{[^}]*"amount"[:\s]*"?([\d.]+)"?',
+                    r'"retailPrice"[:\s]*\{[^}]*"amount"[:\s]*"?([\d.]+)"?',
+                    r'"price"[:\s]*"?([\d]{1,3}[.,]\d{2})"?',
+                    r'\"amount\":\"([\d.]+)\"',
+                ]:
+                    m = re.search(pattern, html)
+                    if m:
+                        result["price"] = m.group(1).replace(",", ".")
+                        break
+
+            await browser.close()
+            logging.info(f"Playwright result: {result}")
     except Exception as e:
-        logging.warning(f"Claude extraction error: {e}")
-        return {}
+        logging.warning(f"Playwright error: {e}")
+    return result
 
-# ─── Scraping Shein ───────────────────────────────────────────────────────────
+# ─── Scraping principal ───────────────────────────────────────────────────────
 
 def extract_name_from_url(url: str) -> str:
     m = re.search(r'shein\.com/(?:[a-z]{2}/)?(.+?)-p-\d+', url)
     if m:
-        return m.group(1).replace("-", " ").title()
+        slug = m.group(1).replace("-", " ").title()
+        return clean_name(slug)
     return "Produit Shein"
 
-def scrape_shein(url: str):
+async def scrape_shein(url: str):
+    """Essaie d'abord requests simple, puis Playwright si prix manquant."""
     name, price, img = None, None, None
-    html_text = ""
 
+    # Tentative rapide via requests
     try:
-        session = requests.Session()
+        import requests as req
+        from bs4 import BeautifulSoup
+        session = req.Session()
         session.get("https://fr.shein.com/", headers=HEADERS, timeout=8)
         r = session.get(url, headers=HEADERS, timeout=15)
         html_text = r.text
 
         if r.status_code == 200 and len(html_text) > 500:
             soup = BeautifulSoup(html_text, "lxml")
-
             og = lambda p: (soup.find("meta", property=p) or {}).get("content")
             name  = og("og:title")
             img   = og("og:image")
@@ -112,47 +178,51 @@ def scrape_shein(url: str):
                         pass
 
             if not price:
-                m_data = re.search(r'"salePrice"[:\s]*\{[^}]*"amount"[:\s]*"?([\d.]+)"?', html_text)
-                if m_data:
-                    price = m_data.group(1)
-
-            if not price:
-                m_data = re.search(r'"price"[:\s]*"?([\d]{1,3}[.,]\d{2})"?', html_text)
-                if m_data:
-                    price = m_data.group(1)
-
+                for pattern in [
+                    r'"salePrice"[:\s]*\{[^}]*"amount"[:\s]*"?([\d.]+)"?',
+                    r'"retailPrice"[:\s]*\{[^}]*"amount"[:\s]*"?([\d.]+)"?',
+                    r'\"amount\":\"([\d.]+)\"',
+                ]:
+                    m2 = re.search(pattern, html_text)
+                    if m2:
+                        price = m2.group(1)
+                        break
     except Exception as e:
-        logging.warning(f"Scraping error: {e}")
+        logging.warning(f"Requests scraping error: {e}")
 
-    if (not name or not price) and html_text and CLAUDE_KEY:
-        logging.info("Fallback vers Claude pour extraction...")
-        extracted = extract_with_claude(url, html_text)
+    # Si prix toujours manquant → Playwright
+    if not price or not name:
+        logging.info("Lancement Playwright pour extraction complète...")
+        pw = await scrape_with_playwright(url)
         if not name:
-            name = extracted.get("name")
+            name = pw.get("name")
         if not price:
-            price = extracted.get("price")
+            price = pw.get("price")
         if not img:
-            img = extracted.get("image")
+            img = pw.get("image")
 
-    if not name:
-        name = extract_name_from_url(url)
+    # Nettoyage nom
+    name = clean_name(name) if name else extract_name_from_url(url)
 
+    # Nettoyage prix
     if price:
         price = re.sub(r'[^\d.,]', '', str(price)).replace(",", ".").strip(".")
-        if price in ("", "."):
+        if price in ("", ".") or float(price) < 0.5:
             price = None
 
-    return name or "Produit Shein", price, img
+    return name, price, img
 
-# ─── Formatage message canal (style capture) ─────────────────────────────────
+# ─── Formatage message canal ──────────────────────────────────────────────────
 
 def build_caption(name: str, price, url: str) -> str:
-    # Format exact comme la capture :
-    # NOM DU PRODUIT 😍
-    # Prix : 12.99€
-    # -60% coupon : TU87V 🏷️
-    #
-    # 👉 https://...
+    """
+    Format comme la capture :
+    NOM DU PRODUIT 😍
+    Prix : 12.99€
+    -60% coupon : TU87V 🏷️
+
+    👉 https://...
+    """
     lines = [f"{name.upper()} 😍"]
     if price:
         lines.append(f"Prix : {price}€")
@@ -175,31 +245,26 @@ async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Annuler", callback_data="cancel"),
     ]])
 
-    await update.message.reply_text("📋 Aperçu du message :")
+    await update.message.reply_text("📋 Aperçu :")
 
     if img:
         try:
-            await update.message.reply_photo(
-                photo=img,
-                caption=caption,
-                reply_markup=keyboard
-            )
+            await update.message.reply_photo(photo=img, caption=caption, reply_markup=keyboard)
             return
         except Exception as e:
             logging.warning(f"Photo preview failed: {e}")
 
-    await update.message.reply_text(
-        caption,
-        reply_markup=keyboard,
-        disable_web_page_preview=False
-    )
+    await update.message.reply_text(caption, reply_markup=keyboard, disable_web_page_preview=False)
 
 # ─── Handler message entrant ──────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    # Bloquer tout le monde sauf toi
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Accès refusé.")
+        return ConversationHandler.END
 
-    # Accepte shein.com ET onelink.shein.com
+    text = update.message.text.strip()
     url_match = re.search(r'https?://[^\s]*(shein\.com|onelink\.shein\.com)[^\s]*', text)
 
     if not url_match:
@@ -208,7 +273,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Formats acceptés :\n"
             "• https://fr.shein.com/...\n"
             "• https://onelink.shein.com/...\n\n"
-            "💡 Tu peux ajouter le prix directement :\n"
+            "💡 Tu peux aussi ajouter le prix dans le message :\n"
             "https://fr.shein.com/... 12.99"
         )
         return ConversationHandler.END
@@ -220,20 +285,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price_match = re.search(r'\b(\d+[.,]\d{1,2})\b', clean_text)
     manual_price = price_match.group(1).replace(",", ".") if price_match else None
 
-    await update.message.reply_text("⏳ Je récupère les infos du produit...")
+    await update.message.reply_text("⏳ Récupération des infos en cours...")
 
-    # Résoudre lien court onelink → lien Shein réel
+    # Résoudre lien onelink
     if "onelink.shein.com" in raw_url:
         resolved = resolve_url(raw_url)
-        url = resolved if "shein.com" in resolved and "onelink" not in resolved else raw_url
+        scrape_url = resolved if "shein.com" in resolved and "onelink" not in resolved else raw_url
     else:
-        url = raw_url
+        scrape_url = raw_url
 
-    name, scraped_price, img = scrape_shein(url)
+    name, scraped_price, img = await scrape_shein(scrape_url)
     price = manual_price or scraped_price
 
+    # Toujours conserver le lien original court pour l'affichage
     context.user_data.update({"url": raw_url, "name": name, "price": price, "img": img})
-    # On garde le lien original (court) pour le message final
 
     if price:
         await send_preview(update, context)
@@ -241,7 +306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             f"✅ Produit : {name}\n\n"
-            f"💬 Prix non détecté automatiquement.\n"
+            f"💬 Prix non trouvé automatiquement.\n"
             f"Quel est le prix ? (ex: 12.99)\n"
             f"Tape 0 pour ne pas afficher de prix."
         )
@@ -250,6 +315,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Handler prix manuel ──────────────────────────────────────────────────────
 
 async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
     text = update.message.text.strip()
     if text == "0":
         context.user_data["price"] = None
@@ -258,7 +325,7 @@ async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m:
             context.user_data["price"] = m.group(1).replace(",", ".")
         else:
-            await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou 0.")
+            await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou tape 0.")
             return WAIT_PRICE
     await send_preview(update, context)
     return ConversationHandler.END
@@ -266,6 +333,9 @@ async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Handler bouton Publier / Annuler ─────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.callback_query.answer("⛔ Accès refusé.", show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
 
@@ -284,33 +354,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     published = False
 
-    # Tentative 1 : avec image
     if img:
         try:
-            await context.bot.send_photo(
-                chat_id=CANAL,
-                photo=img,
-                caption=caption,
-            )
+            await context.bot.send_photo(chat_id=CANAL, photo=img, caption=caption)
             published = True
         except Exception as e:
-            logging.warning(f"send_photo au canal échoué: {e}")
+            logging.warning(f"send_photo canal échoué: {e}")
 
-    # Tentative 2 : texte seul (avec preview lien)
     if not published:
         try:
-            await context.bot.send_message(
-                chat_id=CANAL,
-                text=caption,
-                disable_web_page_preview=False
-            )
+            await context.bot.send_message(chat_id=CANAL, text=caption, disable_web_page_preview=False)
             published = True
         except Exception as e:
-            logging.error(f"send_message au canal échoué: {e}")
+            logging.error(f"send_message canal échoué: {e}")
             try:
                 await query.edit_message_text(
-                    f"❌ Erreur publication canal :\n{e}\n\n"
-                    f"Vérifie que le bot est bien admin de {CANAL} avec le droit Publier des messages."
+                    f"❌ Erreur publication :\n{e}\n\n"
+                    f"Vérifie que le bot est admin de {CANAL} avec le droit Publier des messages."
                 )
             except Exception:
                 pass
@@ -336,7 +396,7 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_callback))
-    print("🤖 Bot Shein démarré !")
+    print("🤖 Bot Shein v3 démarré !")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
