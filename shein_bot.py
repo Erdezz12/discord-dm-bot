@@ -7,10 +7,10 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler
 )
 
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8630597675:AAH_HEK-Yk9uvF8CDRXynMDnggt1r1PKu7M")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "METS_TON_TOKEN_ICI")
 CANAL      = os.environ.get("CANAL", "@Bonsplanshein")
 CODE_AFFIL = os.environ.get("CODE_AFFIL", "TU87V")
-CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")  # ← Ajoute ta clé Anthropic ici
+CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")
 REMISE     = "60%"
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
@@ -35,7 +35,6 @@ def resolve_url(url: str) -> str:
 # ─── Extraction via Claude AI ─────────────────────────────────────────────────
 
 def extract_with_claude(url: str, html_snippet: str) -> dict:
-    """Utilise Claude pour extraire nom, prix et image depuis le HTML Shein."""
     if not CLAUDE_KEY:
         return {}
     try:
@@ -95,13 +94,11 @@ def scrape_shein(url: str):
         if r.status_code == 200 and len(html_text) > 500:
             soup = BeautifulSoup(html_text, "lxml")
 
-            # Méthode 1 : balises og:
             og = lambda p: (soup.find("meta", property=p) or {}).get("content")
             name  = og("og:title")
             img   = og("og:image")
             price = og("product:price:amount")
 
-            # Méthode 2 : JSON-LD
             if not price:
                 for s in soup.find_all("script", type="application/ld+json"):
                     try:
@@ -114,7 +111,6 @@ def scrape_shein(url: str):
                     except Exception:
                         pass
 
-            # Méthode 3 : cherche __NEXT_DATA__ ou window.__data
             if not price:
                 m_data = re.search(r'"salePrice"[:\s]*\{[^}]*"amount"[:\s]*"?([\d.]+)"?', html_text)
                 if m_data:
@@ -128,7 +124,6 @@ def scrape_shein(url: str):
     except Exception as e:
         logging.warning(f"Scraping error: {e}")
 
-    # Méthode 4 : Claude AI en fallback
     if (not name or not price) and html_text and CLAUDE_KEY:
         logging.info("Fallback vers Claude pour extraction...")
         extracted = extract_with_claude(url, html_text)
@@ -139,11 +134,9 @@ def scrape_shein(url: str):
         if not img:
             img = extracted.get("image")
 
-    # Fallback nom depuis l'URL
     if not name:
         name = extract_name_from_url(url)
 
-    # Nettoyage prix
     if price:
         price = re.sub(r'[^\d.,]', '', str(price)).replace(",", ".").strip(".")
         if price in ("", "."):
@@ -151,19 +144,22 @@ def scrape_shein(url: str):
 
     return name or "Produit Shein", price, img
 
-# ─── Formatage message canal ──────────────────────────────────────────────────
+# ─── Formatage message canal (style capture) ─────────────────────────────────
 
 def build_caption(name: str, price, url: str) -> str:
-    price_line = f"💸 Prix : *{price} €*" if price else ""
-    lines = [
-        f"❗👗 *{name.upper()}* 👗❗",
-        "",
-        price_line,
-        f"🏷️ -{REMISE} avec le coupon : `{CODE_AFFIL}`",
-        "",
-        f"👉 {url}",
-    ]
-    return "\n".join(l for l in lines if l is not None)
+    # Format exact comme la capture :
+    # NOM DU PRODUIT 😍
+    # Prix : 12.99€
+    # -60% coupon : TU87V 🏷️
+    #
+    # 👉 https://...
+    lines = [f"{name.upper()} 😍"]
+    if price:
+        lines.append(f"Prix : {price}€")
+    lines.append(f"-{REMISE} coupon : {CODE_AFFIL} 🏷️")
+    lines.append("")
+    lines.append(f"👉 {url}")
+    return "\n".join(lines)
 
 # ─── Aperçu utilisateur ───────────────────────────────────────────────────────
 
@@ -179,14 +175,13 @@ async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Annuler", callback_data="cancel"),
     ]])
 
-    await update.message.reply_text("📋 *Aperçu du message :*", parse_mode="Markdown")
+    await update.message.reply_text("📋 Aperçu du message :")
 
     if img:
         try:
             await update.message.reply_photo(
                 photo=img,
                 caption=caption,
-                parse_mode="Markdown",
                 reply_markup=keyboard
             )
             return
@@ -195,7 +190,6 @@ async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         caption,
-        parse_mode="Markdown",
         reply_markup=keyboard,
         disable_web_page_preview=False
     )
@@ -204,17 +198,18 @@ async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # Accepte shein.com ET onelink.shein.com
     url_match = re.search(r'https?://[^\s]*(shein\.com|onelink\.shein\.com)[^\s]*', text)
 
     if not url_match:
         await update.message.reply_text(
-            "👋 Envoyez-moi un lien Shein !\n\n"
+            "👋 Envoie-moi un lien Shein !\n\n"
             "✅ Formats acceptés :\n"
-            "• `https://fr.shein.com/...`\n"
-            "• `https://onelink.shein.com/...`\n\n"
-            "💡 Vous pouvez ajouter le prix directement :\n"
-            "`https://fr.shein.com/... 12.99`",
-            parse_mode="Markdown"
+            "• https://fr.shein.com/...\n"
+            "• https://onelink.shein.com/...\n\n"
+            "💡 Tu peux ajouter le prix directement :\n"
+            "https://fr.shein.com/... 12.99"
         )
         return ConversationHandler.END
 
@@ -227,7 +222,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Je récupère les infos du produit...")
 
-    # Résoudre lien court onelink
+    # Résoudre lien court onelink → lien Shein réel
     if "onelink.shein.com" in raw_url:
         resolved = resolve_url(raw_url)
         url = resolved if "shein.com" in resolved and "onelink" not in resolved else raw_url
@@ -237,18 +232,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name, scraped_price, img = scrape_shein(url)
     price = manual_price or scraped_price
 
-    context.user_data.update({"url": url, "name": name, "price": price, "img": img})
+    context.user_data.update({"url": raw_url, "name": name, "price": price, "img": img})
+    # On garde le lien original (court) pour le message final
 
     if price:
         await send_preview(update, context)
         return ConversationHandler.END
     else:
         await update.message.reply_text(
-            f"✅ Produit : *{name}*\n\n"
+            f"✅ Produit : {name}\n\n"
             f"💬 Prix non détecté automatiquement.\n"
-            f"Quel est le prix ? (ex: `12.99`)\n"
-            f"Tapez `0` pour ne pas afficher de prix.",
-            parse_mode="Markdown"
+            f"Quel est le prix ? (ex: 12.99)\n"
+            f"Tape 0 pour ne pas afficher de prix."
         )
         return WAIT_PRICE
 
@@ -263,7 +258,7 @@ async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m:
             context.user_data["price"] = m.group(1).replace(",", ".")
         else:
-            await update.message.reply_text("❌ Envoyez un nombre comme `12.99` ou `0`.", parse_mode="Markdown")
+            await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou 0.")
             return WAIT_PRICE
     await send_preview(update, context)
     return ConversationHandler.END
@@ -296,7 +291,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=CANAL,
                 photo=img,
                 caption=caption,
-                parse_mode="Markdown"
             )
             published = True
         except Exception as e:
@@ -308,7 +302,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=CANAL,
                 text=caption,
-                parse_mode="Markdown",
                 disable_web_page_preview=False
             )
             published = True
@@ -316,9 +309,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"send_message au canal échoué: {e}")
             try:
                 await query.edit_message_text(
-                    f"❌ Erreur publication canal :\n`{e}`\n\n"
-                    f"Vérifie que le bot est bien *admin* de `{CANAL}` avec le droit *Publier des messages*.",
-                    parse_mode="Markdown"
+                    f"❌ Erreur publication canal :\n{e}\n\n"
+                    f"Vérifie que le bot est bien admin de {CANAL} avec le droit Publier des messages."
                 )
             except Exception:
                 pass
@@ -326,10 +318,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if published:
         try:
-            await query.edit_message_caption(caption="🎉 *Publié dans le canal !* 🚀", parse_mode="Markdown")
+            await query.edit_message_caption(caption="🎉 Publié dans le canal ! 🚀")
         except Exception:
             try:
-                await query.edit_message_text("🎉 *Publié dans le canal !* 🚀", parse_mode="Markdown")
+                await query.edit_message_text("🎉 Publié dans le canal ! 🚀")
             except Exception:
                 pass
 
@@ -344,7 +336,7 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_callback))
-    print("🤖 Bot Shein H24 démarré !")
+    print("🤖 Bot Shein démarré !")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
