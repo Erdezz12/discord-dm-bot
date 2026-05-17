@@ -263,22 +263,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Bloquer tout le monde sauf toi
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("⛔ Accès refusé.")
-        return ConversationHandler.END
+        return
 
-    # Si on attend une saisie manuelle de prix après clic sur "Saisir manuellement"
+    text = update.message.text.strip()
+
+    # Si on attend une saisie manuelle de prix
     if context.user_data.get("awaiting_custom_price"):
         context.user_data["awaiting_custom_price"] = False
-        text = update.message.text.strip()
         m = re.search(r'(\d+[.,]?\d{0,2})', text)
         if m:
             context.user_data["price"] = m.group(1).replace(",", ".")
             await send_preview(update, context)
-            return ConversationHandler.END
         else:
             await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou 15")
-            return WAIT_PRICE_CUSTOM
-
-    text = update.message.text.strip()
+            context.user_data["awaiting_custom_price"] = True
+        return
     url_match = re.search(r'https?://[^\s]*(shein\.com|onelink\.shein\.com)[^\s]*', text)
 
     if not url_match:
@@ -290,7 +289,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💡 Tu peux aussi ajouter le prix dans le message :\n"
             "https://fr.shein.com/... 12.99"
         )
-        return ConversationHandler.END
+        return
 
     raw_url = url_match.group(0)
 
@@ -312,14 +311,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = manual_price or scraped_price
 
     # Toujours conserver le lien original court pour l'affichage
-    context.user_data.update({"url": raw_url, "name": name, "price": price, "img": img})
+    context.user_data.update({"url": raw_url, "name": name, "price": price, "img": img, "awaiting_custom_price": False})
 
     if price:
         await send_preview(update, context)
-        return ConversationHandler.END
     else:
-        await ask_price_keyboard(update, context.user_data.get("name", ""))
-        return WAIT_PRICE
+        await ask_price_keyboard(update, name)
 
 # ─── Clavier de sélection de prix ────────────────────────────────────────────
 
@@ -344,17 +341,8 @@ async def ask_price_keyboard(update: Update, name: str):
 # ─── Handler prix manuel (saisie texte après avoir cliqué "Saisir manuellement") ─
 
 async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return ConversationHandler.END
-    text = update.message.text.strip()
-    m = re.search(r'(\d+[.,]?\d{0,2})', text)
-    if m:
-        context.user_data["price"] = m.group(1).replace(",", ".")
-        await send_preview(update, context)
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou 15")
-        return WAIT_PRICE_CUSTOM
+    # Gardé pour compatibilité, la logique est dans handle_message
+    pass
 
 
 # ─── Aperçu depuis un callback query (pas un message) ────────────────────────
@@ -417,10 +405,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Publier / Annuler ──────────────────────────────────────────────────────
     if query.data == "cancel":
+        context.user_data.clear()
         try:
-            await query.edit_message_caption(caption="❌ Annulé.")
+            await query.edit_message_caption(caption="❌ Annulé. Envoie un nouveau lien quand tu veux !")
         except Exception:
-            await query.edit_message_text("❌ Annulé.")
+            await query.edit_message_text("❌ Annulé. Envoie un nouveau lien quand tu veux !")
         return
 
     if query.data != "publish":
@@ -457,11 +446,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if published:
+        context.user_data.clear()
         try:
-            await query.edit_message_caption(caption="🎉 Publié dans le canal ! 🚀")
+            await query.edit_message_caption(caption="🎉 Publié dans le canal ! 🚀\n\nEnvoie un nouveau lien quand tu veux !")
         except Exception:
             try:
-                await query.edit_message_text("🎉 Publié dans le canal ! 🚀")
+                await query.edit_message_text("🎉 Publié dans le canal ! 🚀\n\nEnvoie un nouveau lien quand tu veux !")
             except Exception:
                 pass
 
@@ -469,17 +459,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
-        states={
-            WAIT_PRICE:        [CallbackQueryHandler(handle_callback)],
-            WAIT_PRICE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_price)],
-        },
-        fallbacks=[]
-    )
-    app.add_handler(conv)
+
+    # Pas de ConversationHandler — handlers simples, jamais bloquants
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    print("🤖 Bot Shein v5 démarré !")
+
+    print("🤖 Bot Shein v6 démarré !")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
