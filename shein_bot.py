@@ -16,7 +16,8 @@ REMISE     = "60%"
 OWNER_ID   = int(os.environ.get("OWNER_ID", "0"))  # remplace 0 par ton ID
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-WAIT_PRICE = 1
+WAIT_PRICE        = 1
+WAIT_PRICE_CUSTOM = 2
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -264,6 +265,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Accès refusé.")
         return ConversationHandler.END
 
+    # Si on attend une saisie manuelle de prix après clic sur "Saisir manuellement"
+    if context.user_data.get("awaiting_custom_price"):
+        context.user_data["awaiting_custom_price"] = False
+        text = update.message.text.strip()
+        m = re.search(r'(\d+[.,]?\d{0,2})', text)
+        if m:
+            context.user_data["price"] = m.group(1).replace(",", ".")
+            await send_preview(update, context)
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou 15")
+            return WAIT_PRICE_CUSTOM
+
     text = update.message.text.strip()
     url_match = re.search(r'https?://[^\s]*(shein\.com|onelink\.shein\.com)[^\s]*', text)
 
@@ -304,31 +318,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_preview(update, context)
         return ConversationHandler.END
     else:
-        await update.message.reply_text(
-            f"✅ Produit : {name}\n\n"
-            f"💬 Prix non trouvé automatiquement.\n"
-            f"Quel est le prix ? (ex: 12.99)\n"
-            f"Tape 0 pour ne pas afficher de prix."
-        )
+        await ask_price_keyboard(update, context.user_data.get("name", ""))
         return WAIT_PRICE
 
-# ─── Handler prix manuel ──────────────────────────────────────────────────────
+# ─── Clavier de sélection de prix ────────────────────────────────────────────
+
+async def ask_price_keyboard(update: Update, name: str):
+    """Envoie un clavier inline avec des tranches de prix rapides."""
+    tranches = [
+        ["0-5€", "5-10€", "10-15€", "15-20€"],
+        ["20-30€", "30-40€", "40-50€", "50-75€"],
+        ["75-100€", "100-150€", "150-200€", "200-300€"],
+        ["✏️ Saisir le prix manuellement", "🚫 Sans prix"],
+    ]
+    keyboard = []
+    for row in tranches:
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"price:{label}") for label in row])
+
+    await update.message.reply_text(
+        f"💬 Prix non trouvé pour *{name}*\n\nChoisis une tranche ou saisis le prix :",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ─── Handler prix manuel (saisie texte après avoir cliqué "Saisir manuellement") ─
 
 async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     text = update.message.text.strip()
-    if text == "0":
-        context.user_data["price"] = None
+    m = re.search(r'(\d+[.,]?\d{0,2})', text)
+    if m:
+        context.user_data["price"] = m.group(1).replace(",", ".")
+        await send_preview(update, context)
+        return ConversationHandler.END
     else:
-        m = re.search(r'(\d+[.,]\d{1,2})', text)
-        if m:
-            context.user_data["price"] = m.group(1).replace(",", ".")
-        else:
-            await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou tape 0.")
-            return WAIT_PRICE
-    await send_preview(update, context)
-    return ConversationHandler.END
+        await update.message.reply_text("❌ Envoie un nombre comme 12.99 ou 15")
+        return WAIT_PRICE_CUSTOM
+
+
+# ─── Aperçu depuis un callback query (pas un message) ────────────────────────
+
+async def send_preview_from_query(query, context: ContextTypes.DEFAULT_TYPE):
+    url     = context.user_data["url"]
+    name    = context.user_data["name"]
+    price   = context.user_data.get("price")
+    img     = context.user_data.get("img")
+    caption = build_caption(name, price, url)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Publier dans le canal", callback_data="publish"),
+        InlineKeyboardButton("❌ Annuler", callback_data="cancel"),
+    ]])
+
+    if img:
+        try:
+            await query.message.reply_photo(photo=img, caption=caption, reply_markup=keyboard)
+            return
+        except Exception as e:
+            logging.warning(f"Photo preview failed: {e}")
+    await query.message.reply_text(caption, reply_markup=keyboard, disable_web_page_preview=False)
 
 # ─── Handler bouton Publier / Annuler ─────────────────────────────────────────
 
@@ -339,11 +388,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data != "publish":
+    # ── Sélection de prix via clavier ──────────────────────────────────────────
+    if query.data.startswith("price:"):
+        choix = query.data[6:]  # ex: "10-15€" ou "✏️ Saisir..." ou "🚫 Sans prix"
+
+        if choix == "🚫 Sans prix":
+            context.user_data["price"] = None
+            await query.edit_message_text("✅ Pas de prix affiché.")
+            await send_preview_from_query(query, context)
+            return
+
+        if choix == "✏️ Saisir le prix manuellement":
+            await query.edit_message_text("✏️ Tape le prix exact (ex: 12.99) :")
+            context.user_data["awaiting_custom_price"] = True
+            return
+
+        # Tranche choisie → prendre la valeur du milieu
+        m = re.findall(r'\d+', choix)
+        if len(m) == 2:
+            mid = (int(m[0]) + int(m[1])) / 2
+            context.user_data["price"] = f"{mid:.2f}"
+        elif len(m) == 1:
+            context.user_data["price"] = m[0] + ".00"
+
+        await query.edit_message_text(f"✅ Prix sélectionné : {context.user_data['price']}€")
+        await send_preview_from_query(query, context)
+        return
+
+    # ── Publier / Annuler ──────────────────────────────────────────────────────
+    if query.data == "cancel":
         try:
             await query.edit_message_caption(caption="❌ Annulé.")
         except Exception:
             await query.edit_message_text("❌ Annulé.")
+        return
+
+    if query.data != "publish":
         return
 
     url     = context.user_data.get("url")
@@ -391,12 +471,15 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
-        states={WAIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_price)]},
+        states={
+            WAIT_PRICE:        [CallbackQueryHandler(handle_callback)],
+            WAIT_PRICE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_price)],
+        },
         fallbacks=[]
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_callback))
-    print("🤖 Bot Shein v3 démarré !")
+    print("🤖 Bot Shein v5 démarré !")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
